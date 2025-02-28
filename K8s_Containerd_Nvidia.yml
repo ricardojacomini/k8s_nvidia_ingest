@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-# Playbook CryoSparc Live Worker
+# Playbook Kubernetes Cluster Setup with Containerd and NVIDIA Support
+#
 # The Advanced Research Computing at Hopkins (ARCH)
 # Ricardo S Jacomini <rdesouz4@jhu.edu>
 # Date: Feb 28, 2025
 
-# Kubernetes Cluster Setup with Containerd and NVIDIA Support
 # Single Control Plane (c267) and Multi-Worker Installation (c276, icgpu10)
 
 # Master (Control Plane) Setup
@@ -47,9 +47,9 @@
       fail:
         msg: "OS should be Ubuntu 24.04 or Rocky Linux 8, not {{ ansible_distribution }} {{ ansible_distribution_version }}"
       when: >
+        ansible_distribution not in ['Ubuntu', 'Rocky'] or
         (ansible_distribution == 'Ubuntu' and ansible_distribution_version != '24.04') or
-        (ansible_distribution == 'Rocky' and ansible_distribution_version != '8') or
-        (ansible_distribution != 'Ubuntu' and ansible_distribution != 'Rocky')
+        (ansible_distribution == 'Rocky' and ansible_distribution_version != '8')
 
     - name: Update System Packages
       block:
@@ -114,9 +114,9 @@
     - name: Configure Containerd for Kubernetes
       block:
         - name: Generate Default Containerd Configuration
-          shell: containerd config default > /etc/containerd/config.toml
-          args:
-            creates: /etc/containerd/config.toml
+          shell: |
+            containerd config default > /etc/containerd/config.new
+            mv /etc/containerd/config.new /etc/containerd/config.toml
 
         - name: Enable Systemd Cgroup Driver
           lineinfile:
@@ -124,7 +124,63 @@
             regexp: 'SystemdCgroup = false'
             line: 'SystemdCgroup = true'
 
-    - name: Add NVIDIA Runtime to Containerd (if GPU is present)
+    - name: Add NVIDIA Repository (Ubuntu)
+      shell: |
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+          sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+          sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Install or Upgrade NVIDIA Container Toolkit (Ubuntu)
+      apt:
+        name: nvidia-container-toolkit
+        state: latest
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Add NVIDIA Repository (Rocky Linux)
+      shell: |
+        curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+        sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+      when: ansible_distribution == 'Rocky'
+
+    - name: Install or Upgrade NVIDIA Container Toolkit (Rocky Linux)
+      block:
+        - name: Remove conflicting NVIDIA packages
+          dnf:
+            name: cm-nvidia-container-toolkit
+            state: absent
+          ignore_errors: yes  # Ignore if not installed or other errors
+
+        - name: Install NVIDIA Container Toolkit packages
+          dnf:
+            name: nvidia-container-toolkit
+            state: latest
+            install_weak_deps: false
+
+        - name: Check if NVIDIA runtime is configured in Containerd
+          shell: grep -q 'nvidia-container-runtime' /etc/containerd/config.toml
+          register: nvidia_runtime_set
+          changed_when: false
+          ignore_errors: true
+
+        - name: Configure NVIDIA Runtime in Containerd
+          shell: sudo nvidia-ctk runtime configure --runtime=containerd
+          when: has_nvidia and nvidia_ctk_check.rc == 0 and nvidia_runtime_set.rc != 0
+      when: ansible_distribution == 'Rocky'
+
+    - name: Install pciutils (if not already installed)
+      package:
+        name: pciutils
+        state: present
+
+    - name: Check if nvidia-ctk is available
+      shell: command -v nvidia-ctk
+      register: nvidia_ctk_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Add NVIDIA Runtime to Containerd (if GPU is present) using blockinfile
       block:
         - name: Modify Containerd Config for NVIDIA
           blockinfile:
@@ -137,7 +193,12 @@
                 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
                   BinaryName = "/usr/bin/nvidia-container-runtime"
                   SystemdCgroup = true
-      when: has_nvidia
+        - name: Enable Systemd Cgroup Driver
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: 'SystemdCgroup\s*=\s*false'
+            replace: 'SystemdCgroup = true'
+      when: has_nvidia and nvidia_ctk_check.rc != 0
 
     - name: Restart Containerd Service
       systemd:
@@ -182,6 +243,18 @@
         name: kubelet
         state: restarted
 
+    - name: Wait for Kubernetes API to be available
+      uri:
+        url: "https://{{ hostvars[groups['master'][0]].ansible_host }}:6443/healthz"
+        method: GET
+        return_content: yes
+        validate_certs: no
+      register: kube_api_status
+      until: kube_api_status.status == 200
+      retries: 20
+      delay: 5
+      when: inventory_hostname in groups['master']
+
 - name: Initialize Kubernetes Control Plane
   hosts: master
   become: yes
@@ -193,8 +266,23 @@
   hosts: workers
   become: yes
   tasks:
-    - name: Run Worker Nodes Setup
-      include_tasks: workers.yml  # Runs AFTER master setup
+    - name: Get Kubernetes Master Node IP
+      set_fact:
+        master_ip: "{{ hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] }}"
 
+    - name: Generate Join Token and CA Hash on Master Node
+      shell: |
+        kubeadm token create --print-join-command
+      register: join_command
+      delegate_to: "{{ groups['master'][0] }}"
+      run_once: true
 
-
+    - name: Join Worker Nodes to Cluster
+      shell: "{{ join_command.stdout }} --cri-socket /run/containerd/containerd.sock >> node_joined.log"
+      args:
+        chdir: /home/rdesouz4
+        creates: node_joined.log
+      register: join_result
+      retries: 5
+      delay: 10
+      until: join_result.rc == 0
