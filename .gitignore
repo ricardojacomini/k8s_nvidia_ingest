@@ -57,3 +57,5 @@ Thumbs.db
 
 # Remove personal notes
 README.txt
+.config/*
+.ansible-lint

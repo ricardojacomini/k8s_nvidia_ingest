@@ -43,13 +43,13 @@
   vars:
     has_nvidia: false  # Default value, dynamically overridden if GPU is detected
   tasks:
-    - name: Fail if OS is not Ubuntu 24.04 or Rocky Linux 8
+    - name: Fail if OS is not Ubuntu 24.04 or Rocky Linux 8.x
       fail:
-        msg: "OS should be Ubuntu 24.04 or Rocky Linux 8, not {{ ansible_distribution }} {{ ansible_distribution_version }}"
+        msg: "OS should be Ubuntu 24.04 or Rocky Linux 8.x, not {{ ansible_distribution }} {{ ansible_distribution_version }}"
       when: >
-        ansible_distribution not in ['Ubuntu', 'Rocky'] or
-        (ansible_distribution == 'Ubuntu' and ansible_distribution_version != '24.04') or
-        (ansible_distribution == 'Rocky' and ansible_distribution_version != '8')
+        (ansible_distribution == "Ubuntu" and ansible_distribution_version != "24.04") or
+        (ansible_distribution == "Rocky" and ansible_distribution_major_version != "8") 
+        # Allows all Rocky Linux 8.x versions
 
     - name: Update System Packages
       block:
@@ -88,7 +88,7 @@
           when: ansible_distribution == 'Rocky'
 
     - name: Check for NVIDIA GPU
-      shell: lspci | grep -q NVIDIA
+      shell: lspci | grep -i NVIDIA
       register: gpu_check
       changed_when: false
       failed_when: false
@@ -193,11 +193,7 @@
                 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
                   BinaryName = "/usr/bin/nvidia-container-runtime"
                   SystemdCgroup = true
-        - name: Enable Systemd Cgroup Driver
-          replace:
-            path: /etc/containerd/config.toml
-            regexp: 'SystemdCgroup\s*=\s*false'
-            replace: 'SystemdCgroup = true'
+
       when: has_nvidia and nvidia_ctk_check.rc != 0
 
     - name: Restart Containerd Service
@@ -238,17 +234,13 @@
         enabled: yes
         state: started
 
-    - name: Restart Kubelet
-      systemd:
-        name: kubelet
-        state: restarted
-
     - name: Wait for Kubernetes API to be available
       uri:
         url: "https://{{ hostvars[groups['master'][0]].ansible_host }}:6443/healthz"
         method: GET
         return_content: yes
         validate_certs: no
+        ignore_errors: true
       register: kube_api_status
       until: kube_api_status.status == 200
       retries: 20
