@@ -1,7 +1,6 @@
 # Kubernetes Cluster Setup with GPU Support
 
 This repository contains playbooks that set up a Kubernetes cluster in Slurm Reservation to evaluate NVIDIA-Ingest with GPU support on the master and worker nodes. It ensures that the GPU worker node is configured correctly to handle GPU workloads, including running NVIDIA Ingest (NV-Ingest) and NeMo Retriever Extraction.
-
 The playbook is divided into three main sections:
 1. **Install and Configure Containerd with NVIDIA Support**: Installs Containerd, configures it for Kubernetes, and adds NVIDIA runtime if a GPU is detected.
 2. **Initialize Kubernetes Control Plane**: Initializes the Kubernetes cluster on the master node.
