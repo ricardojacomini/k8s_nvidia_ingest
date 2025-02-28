@@ -1,0 +1,44 @@
+# -*- coding: utf-8 -*-
+# Playbook CryoSparc Live Worker
+# The Advanced Research Computing at Hopkins (ARCH)
+# Ricardo S Jacomini <rdesouz4@jhu.edu>
+# Date: Feb 28, 2025
+
+- hosts: master
+  become: yes
+  tasks:
+    - name: get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command_raw
+
+    - name: set join command
+      set_fact:
+        join_command: "{{ join_command_raw.stdout_lines[0] }}"
+
+- hosts: workers
+  become: yes
+  vars:
+    ansible_ssh_private_key_file: /etc/kubernetes/key
+  tasks:
+    - name: Ensure worker nodes can reach master on port 6443
+      wait_for:
+        host: "{{ hostvars[groups['master'][0]].ansible_host }}"
+        port: 6443
+        timeout: 10
+
+    - name: Fetch Join Command from Master
+      shell: kubeadm token create --print-join-command
+      delegate_to: master
+      register: join_command
+
+    - name: Execute Join cluster Command
+      shell: "{{ hostvars['master'].join_command }} --cri-socket /run/containerd/containerd.sock >> node_joined.log"
+      args:
+        chdir: /home/{{ ansible_user }}/.kube/
+        creates: /etc/kubernetes/kubelet.conf node_joined.log
+
+    - name: Label GPU worker node
+      become: yes
+      become_user: rdesouz4
+      shell: kubectl label node {{ inventory_hostname }} gpu=true
+      when: inventory_hostname in groups['gpu']

@@ -1,0 +1,106 @@
+# -*- coding: utf-8 -*-
+# Playbook CryoSparc Live Worker
+# The Advanced Research Computing at Hopkins (ARCH)
+# Ricardo S Jacomini <rdesouz4@jhu.edu>
+# Date: Feb 28, 2025
+
+#  File Creation: It creates an empty file for kubeadm configuration.
+#  Configuration: It configures the container runtime and other settings in the kubeadm configuration file.
+#  Cluster Initialization: It initializes the Kubernetes cluster using kubeadm.
+#  Directory and File Management: It creates the .kube directory and copies the admin.conf file for the user.
+#  Network Setup: It installs the Pod network using kubectl.
+
+- hosts: master
+  become: yes
+  tasks:
+    - name: Ensure /etc/kubernetes directory exists
+      file:
+        path: /etc/kubernetes
+        state: directory
+        mode: '0700'
+
+    - name: Generate SSH Key for Kubernetes
+      command: ssh-keygen -t rsa -b 4096 -f /etc/kubernetes/key -N ""
+      args:
+        creates: /etc/kubernetes/key
+
+    - name: Ensure correct permissions on the key
+      file:
+        path: /etc/kubernetes/key
+        mode: '0600'
+
+    - name: Copy SSH Key to Worker Nodes
+      authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', '/etc/kubernetes/key.pub') }}"
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['workers'] }}"
+
+    - name: create an empty file for Kubeadm configuring
+      copy:
+        content: ""
+        dest: /etc/kubernetes/kubeadm-config.yaml
+        force: no
+
+    - name: configuring the container runtime including its cgroup driver
+      blockinfile:
+        path: /etc/kubernetes/kubeadm-config.yaml
+        block: |
+          kind: ClusterConfiguration
+          apiVersion: kubeadm.k8s.io/v1beta3
+          networking:
+            podSubnet: "10.10.10.0/24"
+          ---
+          kind: KubeletConfiguration
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          runtimeRequestTimeout: "15m"
+          cgroupDriver: "systemd"
+          systemReserved:
+            cpu: 100m
+            memory: 350M
+          kubeReserved:
+            memory: 50M
+
+    - name: Initialize Kubernetes Cluster (this could take some time)
+      shell: kubeadm init --cri-socket /run/containerd/containerd.sock --config /etc/kubernetes/kubeadm-config.yaml >> cluster_initialized.log
+      args:
+        chdir: /home/{{ ansible_user }}/.kube/
+        creates: cluster_initialized.log
+
+    - name: create .kube directory
+      become: yes
+      become_user: "{{ ansible_user }}"
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+        mode: 0755
+
+    - name: Set up kubeconfig for user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+
+    - name: Deploy CNI Plugin (Flannel)
+      shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      args:
+          chdir: "{{ ansible_env.HOME }}"
+          creates: pod_network_setup.log
+
+    - name: Deploy NVIDIA Device Plugin (if GPU is present)
+      shell: kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.14.1/nvidia-device-plugin.yml
+      when: has_nvidia
+      args:
+        chdir: /home/{{ ansible_user }}
+        creates: nvidia_device_plugin.log
+        register: nvidia_device_plugin
+
+    - name: install Pod network
+      become: yes
+      become_user: "{{ ansible_user }}"
+      shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml >> pod_network_setup.log
+      args:
+        chdir: "{{ ansible_env.HOME }}"
+        creates: pod_network_setup.log

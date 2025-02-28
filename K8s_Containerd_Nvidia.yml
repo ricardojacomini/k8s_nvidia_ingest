@@ -1,0 +1,200 @@
+# -*- coding: utf-8 -*-
+# Playbook CryoSparc Live Worker
+# The Advanced Research Computing at Hopkins (ARCH)
+# Ricardo S Jacomini <rdesouz4@jhu.edu>
+# Date: Feb 28, 2025
+
+# Kubernetes Cluster Setup with Containerd and NVIDIA Support
+# Single Control Plane (c267) and Multi-Worker Installation (c276, icgpu10)
+
+# Master (Control Plane) Setup
+#
+# Initializes Kubernetes with kubeadm init --cri-socket /run/containerd/containerd.sock.
+# Ensures kubeadm, kubelet, and kubectl are properly configured.
+# Deploys the Flannel CNI plugin for networking.
+
+# Worker Nodes Setup
+#
+# Workers join the cluster using kubeadm join --cri-socket /run/containerd/containerd.sock.
+# Labels GPU workers (icgpu10) correctly for GPU scheduling.
+
+# ansible-playbook -i inventory.ini K8s_Containerd_Nvidia.yml
+
+# Verify the Key Works
+#
+# On the master node (c267), test SSH login:
+#
+# ssh -i /etc/kubernetes/key rdesouz4@c276
+# ssh -i /etc/kubernetes/key rdesouz4@icgpu10
+#
+# kubectl apply -f gpu-test.yaml
+
+#  Command	Description
+#    kubectl delete pod gpu-test	        Deletes the gpu-test pod.
+#    kubectl get pods	                    Lists all pods to find the name of the pod you want to delete.
+#    kubectl delete pod -l app=gpu-test	    Deletes pods with the label app=gpu-test.
+#    kubectl delete pod gpu-test --force	Force deletes a stuck pod.
+#    kubectl delete -f gpu-test.yaml	    Deletes all resources defined in the gpu-test.yaml file.
+
+---
+- name: Install and Configure Containerd with NVIDIA Support
+  hosts: reservations
+  become: yes
+  vars:
+    has_nvidia: false  # Default value, dynamically overridden if GPU is detected
+  tasks:
+    - name: Fail if OS is not Ubuntu 24.04 or Rocky Linux 8
+      fail:
+        msg: "OS should be Ubuntu 24.04 or Rocky Linux 8, not {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      when: >
+        (ansible_distribution == 'Ubuntu' and ansible_distribution_version != '24.04') or
+        (ansible_distribution == 'Rocky' and ansible_distribution_version != '8') or
+        (ansible_distribution != 'Ubuntu' and ansible_distribution != 'Rocky')
+
+    - name: Update System Packages
+      block:
+        - name: Update APT Packages (Ubuntu)
+          apt:
+            update_cache: yes
+          when: ansible_distribution == 'Ubuntu'
+
+        - name: Update YUM Packages (Rocky Linux)
+          yum:
+            name: '*'
+            state: latest
+          when: ansible_distribution == 'Rocky'
+
+    - name: Install Required Dependencies
+      block:
+        - name: Install Dependencies (Ubuntu)
+          apt:
+            name:
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - gnupg
+              - lsb-release
+            state: present
+          when: ansible_distribution == 'Ubuntu'
+
+        - name: Install Dependencies (Rocky)
+          yum:
+            name:
+              - yum-utils
+              - device-mapper-persistent-data
+              - lvm2
+              - curl
+            state: present
+          when: ansible_distribution == 'Rocky'
+
+    - name: Check for NVIDIA GPU
+      shell: lspci | grep -q NVIDIA
+      register: gpu_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set GPU Availability Fact
+      set_fact:
+        has_nvidia: "{{ gpu_check.rc == 0 }}"
+
+    - name: Install Containerd
+      block:
+        - name: Install Containerd (Ubuntu)
+          apt:
+            name: containerd.io
+            state: present
+          when: ansible_distribution == 'Ubuntu'
+
+        - name: Install Containerd (Rocky)
+          yum:
+            name: containerd.io
+            state: present
+          when: ansible_distribution == 'Rocky'
+
+    - name: Configure Containerd for Kubernetes
+      block:
+        - name: Generate Default Containerd Configuration
+          shell: containerd config default > /etc/containerd/config.toml
+          args:
+            creates: /etc/containerd/config.toml
+
+        - name: Enable Systemd Cgroup Driver
+          lineinfile:
+            path: /etc/containerd/config.toml
+            regexp: 'SystemdCgroup = false'
+            line: 'SystemdCgroup = true'
+
+    - name: Add NVIDIA Runtime to Containerd (if GPU is present)
+      block:
+        - name: Modify Containerd Config for NVIDIA
+          blockinfile:
+            path: /etc/containerd/config.toml
+            insertafter: '.*\[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options\]'
+            block: |
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+                runtime_type = "io.containerd.runc.v2"
+                privileged_without_host_devices = false
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+                  BinaryName = "/usr/bin/nvidia-container-runtime"
+                  SystemdCgroup = true
+      when: has_nvidia
+
+    - name: Restart Containerd Service
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Verify containerd status
+      shell: systemctl is-active containerd
+      register: containerd_status
+      failed_when: "'inactive' in containerd_status.stdout"
+
+    - name: Install Kubernetes Components (kubeadm, kubelet, kubectl)
+      block:
+        - name: Install Kubernetes (Ubuntu)
+          apt:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+            state: present
+          when: ansible_distribution == 'Ubuntu'
+
+        - name: Install Kubernetes (Rocky)
+          yum:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+            state: present
+          when: ansible_distribution == 'Rocky'
+
+    - name: Enable and Start Kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    - name: Restart Kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+
+- name: Initialize Kubernetes Control Plane
+  hosts: master
+  become: yes
+  tasks:
+    - name: Run Master Setup
+      include_tasks: master.yml  # Runs AFTER all previous tasks
+
+- name: Join Worker Nodes to Cluster
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Run Worker Nodes Setup
+      include_tasks: workers.yml  # Runs AFTER master setup
+
+
+

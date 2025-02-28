@@ -1,0 +1,108 @@
+# -*- coding: utf-8 -*-
+# Playbook CryoSparc Live Worker
+# The Advanced Research Computing at Hopkins (ARCH)
+# Ricardo S Jacomini <rdesouz4@jhu.edu>
+# Date: Feb 28, 2025
+
+#  How to Use the Playbook
+#
+#  Replace <your_ngc_api_key>:
+#    Replace <your_ngc_api_key> with your actual NVIDIA NGC API key.
+#  Run the Playbook:
+#  Execute the playbook using the following command:
+#    ansible-playbook -i inventory.ini nv-ingest.yml
+
+#  Verify the Deployment:
+#  After the playbook runs, verify that the NV-Ingest components are deployed:
+#    kubectl get pods -n nv-ingest
+
+---
+- name: Deploy NV-Ingest using Helm
+  hosts: master  # Run this playbook on the master node
+  become: yes
+  vars:
+    namespace: "nv-ingest"
+    ngc_api_key: "<your_ngc_api_key>"  # Replace with your NGC API key
+    helm_chart_version: "0.4.0"
+    helm_repo_url: "https://helm.ngc.nvidia.com/nvidia/nemo-microservices/charts/nv-ingest-{{ helm_chart_version }}.tgz"
+    image_repository: "nvcr.io/nvidia/nemo-microservices/nv-ingest"
+    image_tag: "24.12"
+    create_secrets: true  # Set to false if you want to manually create secrets
+
+  tasks:
+    - name: Ensure required Ansible collections are installed
+      ansible.builtin.command:
+        cmd: |
+          ansible-galaxy collection install kubernetes.core community.kubernetes
+      changed_when: false  # This task does not change the system state
+
+    - name: Create the namespace
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ namespace }}"
+        state: present
+
+    - name: Add Nemo Microservices Helm repo
+      community.kubernetes.helm_repository:
+        name: nemo-microservices
+        repo_url: https://helm.ngc.nvidia.com/nvidia/nemo-microservices
+        username: "$oauthtoken"
+        password: "{{ ngc_api_key }}"
+
+    - name: Add NIM Helm repo
+      community.kubernetes.helm_repository:
+        name: nvidia-nim
+        repo_url: https://helm.ngc.nvidia.com/nim/nvidia
+        username: "$oauthtoken"
+        password: "{{ ngc_api_key }}"
+
+    - name: Install NV-Ingest Helm chart
+      community.kubernetes.helm:
+        name: nv-ingest
+        chart_ref: "{{ helm_repo_url }}"
+        namespace: "{{ namespace }}"
+        release_values:
+          image:
+            repository: "{{ image_repository }}"
+            tag: "{{ image_tag }}"
+          imagePullSecret:
+            create: "{{ create_secrets }}"
+            password: "{{ ngc_api_key }}"
+          ngcSecret:
+            create: "{{ create_secrets }}"
+            password: "{{ ngc_api_key }}"
+        username: "$oauthtoken"
+        password: "{{ ngc_api_key }}"
+
+    - name: (Optional) Manually create Kubernetes Secrets
+      block:
+        - name: Generate Docker config JSON
+          set_fact:
+            docker_config: '{"auths":{"nvcr.io":{"username":"$oauthtoken", "password":"{{ ngc_api_key }}" }}}'
+
+        - name: Encode Docker config JSON to base64
+          set_fact:
+            ngc_registry_password: "{{ docker_config | b64encode }}"
+
+        - name: Create Docker config Secret
+          kubernetes.core.k8s:
+            api_version: v1
+            kind: Secret
+            name: nvcrimagepullsecret
+            namespace: "{{ namespace }}"
+            type: kubernetes.io/dockerconfigjson
+            data:
+              .dockerconfigjson: "{{ ngc_registry_password }}"
+            state: present
+
+        - name: Create NGC API Key Secret
+          kubernetes.core.k8s:
+            api_version: v1
+            kind: Secret
+            name: ngc-api
+            namespace: "{{ namespace }}"
+            string_data:
+              NGC_API_KEY: "{{ ngc_api_key }}"
+            state: present
+      when: not create_secrets  # Only run if create_secrets is false
