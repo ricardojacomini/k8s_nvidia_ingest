@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Playbook CryoSparc Live Worker
+# Playbook to set up Worker nodes
 # The Advanced Research Computing at Hopkins (ARCH)
 # Ricardo S Jacomini <rdesouz4@jhu.edu>
 # Date: Feb 28, 2025
